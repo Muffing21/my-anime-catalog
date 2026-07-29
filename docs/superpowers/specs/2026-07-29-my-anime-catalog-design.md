@@ -67,8 +67,9 @@ Three clear layers per feature, plus a single outbound-API module:
 - **controllers** — HTTP only: parse/validate input (via zod), call a service,
   shape the response, forward errors to `next(ApiError...)`.
 - **services** — business logic + **all SQL**. Object exports.
-- **`lib/anilist.ts`** — the ONLY code that talks to AniList (axios). Everything
-  else depends on our own DB.
+- **`services/anilist.service.ts`** — the ONLY code that talks to AniList (axios).
+  Everything else depends on our own DB. (Top-level `services/`, matching
+  `chat-api`'s integration-service convention.)
 - **`db/`** — the `pg` pool, a small `query()` helper, and numbered `.sql`
   migration files applied by a tiny runner.
 
@@ -77,38 +78,47 @@ what it depends on, and can be understood without reading the others' internals.
 
 ## Folder Structure
 
+Mirrors `chat-api`'s layout: everything lives at the **project root** (no `src/`
+wrapper), feature code under `pkg/<feature>/`, cross-cutting external
+integrations under a top-level `services/` folder (the same place `chat-api`
+puts `services/oracle/*.service.ts`).
+
 ```
-src/
-  app.ts                      # express setup, middleware, route mounting, error handler
-  config/
-    constants.config.ts       # env: PORT, DB creds, SESSION_SECRET, COOKIE opts, ANILIST_URL
-    db.config.ts              # pg Pool + connect() + query() helper
-    cache.config.ts           # optional: in-memory/redis TTL layer for anime cache
-  db/
-    migrations/               # 0001_init.sql, ... (schema + indexes + constraints)
-    migrate.ts                # applies migrations in order, tracks applied ones
-  middleware/
-    auth.middleware.ts        # authHandler: reads session cookie -> req.user; else ApiError.unauthorized
-    error.middleware.ts       # errorHandler + errorRoute (ported from chat-api)
-  types/
-    api-error.ts              # ApiError class (ported from chat-api)
-    express/index.d.ts        # augment Express Request with req.user
-  utils/
-    password.helper.ts        # bcrypt hash/compare
-    session.helper.ts         # create / lookup / destroy session rows; cookie helpers
-    pagination.helper.ts
-  pkg/
-    healthcheck/
-      healthcheck.router.ts
-    auth/
-      auth.controller.ts  auth.service.ts  auth.router.ts
-    anime/
-      anime.controller.ts anime.service.ts anime.cache.ts anime.router.ts
-    list/
-      list.controller.ts  list.service.ts  list.router.ts
-  lib/
-    anilist.ts                # AniList client (axios): search + fetch-by-id, normalized
+app.ts                        # express setup, middleware, route mounting, error handler (root, like chat-api)
+config/
+  constants.config.ts         # env: PORT, DB creds, SESSION_SECRET, COOKIE opts, ANILIST_URL
+  db.config.ts                # pg Pool + connect() + query() helper
+  cache.config.ts             # optional: in-memory/redis TTL layer for anime cache
+db/                           # replaces chat-api's Sequelize models/ + sync(): raw-SQL schema lives here
+  migrations/                 # 0001_init.sql, ... (schema + indexes + constraints)
+  migrate.ts                  # applies migrations in order, tracks applied ones
+middleware/
+  auth.middleware.ts          # authHandler: reads session cookie -> req.user; else ApiError.unauthorized
+  error.middleware.ts         # errorHandler + errorRoute (ported from chat-api)
+types/
+  api-error.ts                # ApiError class (ported from chat-api)
+  express/index.d.ts          # augment Express Request with req.user
+utils/
+  password.helper.ts          # bcrypt hash/compare
+  session.helper.ts           # create / lookup / destroy session rows; cookie helpers
+  pagination.helper.ts
+services/                     # top-level integration services, like chat-api's services/oracle/
+  anilist.service.ts          # the ONLY code that calls AniList (axios): search + fetch-by-id, normalized
+pkg/
+  healthcheck/
+    healthcheck.router.ts
+  auth/
+    auth.controller.ts  auth.service.ts  auth.router.ts
+  anime/
+    anime.controller.ts anime.service.ts anime.cache.ts anime.router.ts
+  list/
+    list.controller.ts  list.service.ts  list.router.ts
 ```
+
+Note: `chat-api` has no migration files (it relies on Sequelize `sync()`). Since
+we use raw SQL, the top-level `db/` folder is a deliberate, necessary addition —
+it is the raw-SQL replacement for `chat-api`'s `models/` layer, kept at the root
+to stay consistent with the flat, root-level convention.
 
 ## Data Model (raw SQL — `db/migrations/*.sql`)
 
@@ -160,14 +170,15 @@ as in `chat-api`.
 
 ## Read-Through Cache Flow
 
-1. **Search** — `GET /anime/search?q=` → `anime.service.search` → `lib/anilist`
-   queries AniList live (search is broad and not cacheable per-id). Results are
-   returned for display; nothing is necessarily persisted yet.
+1. **Search** — `GET /anime/search?q=` → `anime.service.search` →
+   `services/anilist.service` queries AniList live (search is broad and not
+   cacheable per-id). Results are returned for display; nothing is necessarily
+   persisted yet.
 2. **Add to list** — `POST /list` with an `anilistId` → `anime.service` looks up
    `anime` by `anilist_id`:
    - **hit** → use existing local `anime.id`.
-   - **miss** → `lib/anilist` fetches that one anime → normalize into our columns
-     → `INSERT` → use the new local `anime.id`.
+   - **miss** → `services/anilist.service` fetches that one anime → normalize into
+     our columns → `INSERT` → use the new local `anime.id`.
 3. **View one anime** — `GET /anime/:anilistId` → `anime.service` looks up by
    `anilist_id`; **hit** serves from our DB, **miss** fetches that one anime from
    AniList, normalizes, inserts, and returns it. This is the third (and final)
@@ -232,7 +243,7 @@ Two id spaces exist and must not be confused:
   unknown errors → 500; `errorRoute` handles unmatched routes as 404.
 - **Ownership** enforced in `list.service`: every list operation is scoped to
   `req.user.id`; a user can never read or mutate another user's entries.
-- **AniList failures/timeouts** → caught in `lib/anilist` / `anime.service` and
+- **AniList failures/timeouts** → caught in `services/anilist.service` / `anime.service` and
   surfaced as `ApiError.internal`/502-style; a third-party outage never crashes a
   request.
 - Zod validation errors → `ApiError.badRequest` with a readable message.
@@ -240,7 +251,7 @@ Two id spaces exist and must not be confused:
 ## Testing
 
 Learning-appropriate but real: **integration tests** hitting the Express app
-against a **test Postgres database**, with `lib/anilist.ts` **mocked** (no live
+against a **test Postgres database**, with `services/anilist.service.ts` **mocked** (no live
 network in tests). Focus on the parts with real logic:
 
 - Read-through cache: cache **hit** vs **miss** (miss triggers one AniList fetch +
@@ -252,11 +263,12 @@ network in tests). Focus on the parts with real logic:
 
 The implementation plan MUST include full project setup, not just feature code:
 
-1. Node + TypeScript project init (`package.json`, `tsconfig.json`, `nodemon`,
-   `ts-node`, npm scripts `dev` / `build` / `start` / `migrate` / `test`).
+1. Node + TypeScript project init with **yarn** (matches `chat-api`:
+   `package.json`, `tsconfig.json`, `nodemon`, `ts-node`, `yarn.lock`), and yarn
+   scripts `dev` / `build` / `start` / `migrate` / `test`.
 2. Dependencies: `express`, `pg`, `bcrypt`, `zod`, `cookie-parser`, `helmet`,
    `cors`, `morgan`, `dotenv`, `axios`; dev: `typescript`, `@types/*`, `nodemon`,
-   `ts-node`, a test runner.
+   `ts-node`, `vitest` (test runner).
 3. Local Postgres via `docker-compose.yml` (matches `chat-api`'s docker usage),
    plus `.env` / `.env.example` (never commit real secrets).
 4. `db/migrate.ts` runner + `0001_init.sql` (schema above).
@@ -267,9 +279,13 @@ The implementation plan MUST include full project setup, not just feature code:
    the `Muffing21` account via `gh` (switching the active `gh` account from the
    work `Harrytopgun`), and push.
 
-## Open Questions
+## Resolved Decisions (previously Open Questions)
 
-1. Should `POST /auth/register` auto-login (set a session immediately), or require
-   a separate login call? (Lean: separate login for clarity in v1.)
-2. Session lifetime / cookie `Max-Age` value (e.g. 7 or 30 days).
-3. Test runner choice (`vitest` vs `node:test` vs `jest`) — decide in the plan.
+1. **Register does NOT auto-login.** `POST /auth/register` creates the account
+   only; the client then calls `POST /auth/login` to get a session. Keeps the two
+   flows clean and independent in v1.
+2. **Session lifetime = 30 days.** The `sessions.expires_at` and the cookie
+   `Max-Age` are both 30 days from login.
+3. **Test runner = `vitest`,** run via `yarn test`. Chosen for first-class
+   TypeScript support and minimal config; the yarn script name matches the
+   author's `yarn`-based `chat-api` workflow.
