@@ -148,7 +148,10 @@ src/
 - `progress integer NOT NULL default 0`
 - `started_at date`, `finished_at date`, `notes text`
 - `created_at timestamptz NOT NULL default now()`
-- `updated_at timestamptz NOT NULL default now()`
+- `updated_at timestamptz NOT NULL default now()` — with no ORM, this does **not**
+  update itself; `list.service` sets `updated_at = now()` explicitly in every
+  UPDATE statement (chosen over a DB trigger to keep all logic visible in the
+  service, matching the raw-SQL learning goal).
 - **`UNIQUE (user_id, anime_id)`** — one entry per anime per user
 - index on `user_id` (list views filter by owner)
 
@@ -165,10 +168,17 @@ as in `chat-api`.
    - **hit** → use existing local `anime.id`.
    - **miss** → `lib/anilist` fetches that one anime → normalize into our columns
      → `INSERT` → use the new local `anime.id`.
-3. `list_entries.anime_id` references the **local** `anime.id`. Therefore list
+3. **View one anime** — `GET /anime/:anilistId` → `anime.service` looks up by
+   `anilist_id`; **hit** serves from our DB, **miss** fetches that one anime from
+   AniList, normalizes, inserts, and returns it. This is the third (and final)
+   code path that can call AniList.
+4. `list_entries.anime_id` references the **local** `anime.id`. Therefore list
    views (`GET /list`) JOIN `list_entries` → `anime` locally and never call
    AniList. This is what keeps us under the rate limit.
-4. `cached_at` allows an optional future refresh policy (not implemented in v1).
+5. `cached_at` allows an optional future refresh policy (not implemented in v1).
+
+The three (and only three) code paths that reach AniList: search, add-to-list on
+cache miss, and view-one-anime on cache miss.
 
 ## Authentication (cookie sessions)
 
@@ -194,11 +204,25 @@ as in `chat-api`.
 | POST | `/api/v1/auth/logout` | ✓ | destroy session |
 | GET | `/api/v1/auth/me` | ✓ | current user |
 | GET | `/api/v1/anime/search?q=` | — | AniList-backed search |
-| GET | `/api/v1/anime/:id` | — | one anime from local cache (fetch-on-miss) |
+| GET | `/api/v1/anime/:anilistId` | — | one anime from local cache (fetch-on-miss) |
 | GET | `/api/v1/list?status=&sort=` | ✓ | my list, filter/sort |
 | POST | `/api/v1/list` | ✓ | add anime to my list (`anilistId`, status, ...) |
 | PATCH | `/api/v1/list/:animeId` | ✓ | update status / score / progress |
 | DELETE | `/api/v1/list/:animeId` | ✓ | remove entry |
+
+### Identifier conventions (which id each route uses)
+
+Two id spaces exist and must not be confused:
+
+- **AniList id** (`anilist_id`, integer) — how the outside world / search results
+  refer to an anime. Used by routes that may need to *fetch on miss*:
+  `GET /api/v1/anime/:anilistId` and the `anilistId` field in the `POST /list`
+  body. If the anime isn't cached locally, we can fetch it from AniList by this id.
+- **Local `anime.id`** (uuid) — our internal primary key that `list_entries`
+  references. Used to address an **existing** list entry the client already holds:
+  `:animeId` in `PATCH /api/v1/list/:animeId` and `DELETE /api/v1/list/:animeId`
+  is the local `anime.id` uuid (the anime is guaranteed to be cached by then,
+  because you can only PATCH/DELETE an entry that was already added).
 
 ## Error Handling
 
