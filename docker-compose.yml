@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: anime
+      POSTGRES_PASSWORD: anime
+      POSTGRES_DB: anime_catalog
+    ports:
+      - "5433:5432"
+    volumes:
+      - anime_pgdata:/var/lib/postgresql/data
+      - ./db/init-test-db.sql:/docker-entrypoint-initdb.d/init-test-db.sql
+volumes:
+  anime_pgdata:
